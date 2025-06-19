@@ -4,10 +4,13 @@ from pymongo import MongoClient
 import time
 import random
 import re
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
+# Cấu hình MongoDB Atlas
 MONGO_URI = "mongodb+srv://lumconon0911:SWD-SWD@cluster.slolqwf.mongodb.net/"
 DATABASE_NAME = "topdev_jobs_db"
 COLLECTION_NAME = "job_details"
+BASE_URL = "https://vieclam24h.vn"
 
 
 def has_all_classes(tag, class_string):
@@ -34,7 +37,6 @@ def get_html_content(url):
 def extract_detail_links(html_content):
     soup = BeautifulSoup(html_content, 'html.parser')
     unique_detail_links = set()
-    base_url = "https://vieclam24h.vn"  # Thêm base_url vào đây
 
     target_classes_listing_page = "grid grid-cols-1 gap-y-2 lg:gap-y-2.5"
 
@@ -47,17 +49,14 @@ def extract_detail_links(html_content):
         for link in links:
             href = link['href']
 
-            # --- THAY ĐỔI ĐÃ THÊM Ở ĐÂY ---
-            # Nếu href chứa từ "page" (không phân biệt chữ hoa/thường), bỏ qua.
             if "page" in href.lower():
-                print(f"Bỏ qua liên kết phân trang: {href}")
+                # print(f"Bỏ qua liên kết phân trang: {href}")
                 continue
-            # --- HẾT THAY ĐỔI ---
 
             if href.startswith('http'):
                 unique_detail_links.add(href)
             else:
-                full_link = f"{base_url}{href}"
+                full_link = f"{BASE_URL}{href}"
                 unique_detail_links.add(full_link)
     else:
         print(f"Không tìm thấy container với các class: '{target_classes_listing_page}'.")
@@ -108,12 +107,29 @@ def extract_section_content(soup_obj, heading_text):
     return "Không tìm thấy."
 
 
+def normalize_url(url):
+    """
+    Chuẩn hóa URL về một định dạng nhất quán.
+    Xóa các đoạn (fragments), sắp xếp tham số truy vấn và xóa các dấu gạch chéo thừa.
+    """
+    parsed = urlparse(url)
+    path = parsed.path
+    query_params = parse_qs(parsed.query, keep_blank_values=True)
+    sorted_query = urlencode(sorted(query_params.items()), doseq=True)
+    if path.endswith('/') and len(path) > 1:
+        path = path.rstrip('/')
+    scheme = parsed.scheme.lower()
+    netloc = parsed.netloc.lower()
+    normalized_url = urlunparse((scheme, netloc, path, parsed.params, sorted_query, ''))
+    return normalized_url
+
+
 def process_detail_link(detail_url, collection):
-    print(f"\n--- Đang xử lý liên kết chi tiết: {detail_url} ---")
-    detail_html = get_html_content(detail_url)
+    normalized_detail_url = normalize_url(detail_url)
+    print(f"\n--- Đang xử lý liên kết chi tiết: {normalized_detail_url} ---")
+    detail_html = get_html_content(normalized_detail_url)
 
     if detail_html:
-        print(f"Đã lấy được nội dung HTML của trang chi tiết '{detail_url}'.")
         detail_soup = BeautifulSoup(detail_html, 'html.parser')
 
         job_title = detail_soup.find('title').get_text(strip=True) if detail_soup.find(
@@ -133,18 +149,18 @@ def process_detail_link(detail_url, collection):
         if benefits_content == "Không tìm thấy.":
             benefits_content = extract_section_content(detail_soup, "Benefits")
 
-        # --- KIỂM TRA ĐIỀU KIỆN LƯU VÀO DATABASE ---
-        # Chỉ lưu vào database nếu ít nhất một trong ba phần chính có nội dung khác "Không tìm thấy."
+        # Nếu không có nội dung chính, bỏ qua
         if (responsibilities_content == "Không tìm thấy." and
                 requirements_content == "Không tìm thấy." and
                 benefits_content == "Không tìm thấy."):
             print(
-                f"⚠️ Bỏ qua lưu vào database cho '{job_title}' ({detail_url}). Không tìm thấy nội dung Mô tả công việc, Yêu cầu công việc, hoặc Quyền lợi.")
-            print("-" * (len(detail_url) + 40))
-            return  # Dừng hàm tại đây, không lưu vào database
+                f"⚠️ Bỏ qua lưu vào database cho '{job_title}' ({normalized_detail_url}). Không tìm thấy nội dung Mô tả công việc, Yêu cầu công việc, hoặc Quyền lợi.")
+            print("-" * (len(normalized_detail_url) + 40))
+            return
 
+        # Dữ liệu công việc để lưu trữ
         job_data = {
-            "url": detail_url,
+            "url": normalized_detail_url,
             "title": job_title,
             "responsibilities": responsibilities_content,
             "requirements": requirements_content,
@@ -152,25 +168,59 @@ def process_detail_link(detail_url, collection):
             "crawled_at": time.strftime("%Y-%m-%d %H:%M:%S")
         }
 
-        try:
-            result = collection.update_one(
-                {'url': job_data['url']},
-                {'$set': job_data},
-                upsert=True
-            )
+        # --- LOGIC KIỂM TRA TRÙNG LẶP MỚI: Nếu trùng title HOẶC responsibilities thì KHÔNG THÊM ---
 
-            if result.upserted_id:
-                print(f"✅ Đã thêm mới dữ liệu cho '{job_data['title']}' vào MongoDB (ID: {result.upserted_id}).")
-            elif result.modified_count > 0:
-                print(f"✅ Đã cập nhật dữ liệu cho '{job_data['title']}' trong MongoDB.")
-            else:
-                print(f"ℹ️ Dữ liệu cho '{job_data['title']}' đã tồn tại và không có thay đổi.")
+        # 1. Kiểm tra xem có bản ghi nào trùng title không
+        duplicate_by_title = collection.find_one({'title': job_data['title']})
 
-        except Exception as e:
-            print(f"❌ Lỗi khi lưu dữ liệu vào MongoDB cho '{job_data['title']}': {e}")
+        # 2. Kiểm tra xem có bản ghi nào trùng responsibilities không
+        duplicate_by_responsibilities = collection.find_one({'responsibilities': job_data['responsibilities']})
+
+        if duplicate_by_title or duplicate_by_responsibilities:
+            # Nếu tìm thấy trùng lặp theo title HOẶC responsibilities
+            duplicate_criteria = []
+            if duplicate_by_title:
+                duplicate_criteria.append("Tiêu đề")
+            if duplicate_by_responsibilities:
+                duplicate_criteria.append("Mô tả công việc")
+
+            print(
+                f"⚠️ Phát hiện trùng lặp theo {' HOẶC '.join(duplicate_criteria)} cho '{job_data['title']}' ({job_data['url']}).")
+            print(f"   Bỏ qua việc thêm bản ghi này để tránh trùng lặp nội dung.")
+            print("-" * (len(normalized_detail_url) + 40))
+            return  # Dừng hàm, không thêm vào database
+        else:
+            # Nếu không có trùng lặp theo tiêu đề HOẶC mô tả công việc,
+            # thì đây là một công việc mới, chúng ta sẽ thêm nó vào.
+            try:
+                # Vẫn sử dụng upsert dựa trên URL để nếu một công việc có cùng URL nhưng không có nội dung
+                # được thu thập trước đó, nó sẽ được cập nhật.
+                # Tuy nhiên, nếu URL là hoàn toàn mới VÀ nội dung không trùng lặp, nó sẽ được thêm mới.
+                result = collection.update_one(
+                    {'url': job_data['url']},  # Filter by URL to ensure URL uniqueness (if index is active)
+                    {'$set': job_data},
+                    upsert=True  # Chèn nếu không tìm thấy URL, hoặc cập nhật nếu tìm thấy
+                )
+
+                if result.upserted_id:
+                    print(f"✅ Đã thêm mới dữ liệu cho '{job_data['title']}' vào MongoDB (ID: {result.upserted_id}).")
+                elif result.modified_count > 0:
+                    print(f"✅ Đã cập nhật dữ liệu cho '{job_data['title']}' trong MongoDB (dữ liệu URL đã tồn tại).")
+                else:
+                    print(f"ℹ️ Dữ liệu cho '{job_data['title']}' đã tồn tại và không có thay đổi.")
+
+            except Exception as e:
+                # Xử lý trường hợp URL trùng lặp nếu chỉ mục URL duy nhất được bật và bạn cố gắng chèn
+                # một URL đã có mà update_one không xử lý được (ít khả năng xảy ra với upsert=True)
+                if "E11000 duplicate key error" in str(e) and "url" in str(e):
+                    print(f"ℹ️ Dữ liệu cho '{job_data['title']}' ({job_data['url']}) đã tồn tại theo URL.")
+                else:
+                    print(f"❌ Lỗi khi lưu dữ liệu vào MongoDB cho '{job_data['title']}': {e}")
+
+        # --- KẾT THÚC LOGIC KIỂM TRA TRÙNG LẶP MỚI ---
 
         print("\n" + "=" * 50)
-        print(f"DỮ LIỆU TRÍCH XUẤT TỪ TRANG CHI TIẾT ({detail_url}):")
+        print(f"DỮ LIỆU TRÍCH XUẤT TỪ TRANG CHI TIẾT ({normalized_detail_url}):")
         print("=" * 50 + "\n")
         print(f"Tiêu đề: {job_title}")
         print(f"1. Mô tả công việc: {responsibilities_content}")
@@ -179,25 +229,9 @@ def process_detail_link(detail_url, collection):
         print("\n" + "=" * 50)
 
     else:
-        print(f"Không thể tải nội dung HTML của trang chi tiết: {detail_url}")
-    print("-" * (len(detail_url) + 40))
+        print(f"Không thể tải nội dung HTML của trang chi tiết: {normalized_detail_url}")
+    print("-" * (len(normalized_detail_url) + 40))
 
-
-import requests
-from bs4 import BeautifulSoup
-from pymongo import MongoClient
-import time
-import random
-import re
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse  # Import necessary modules
-
-# Cấu hình MongoDB Atlas
-MONGO_URI = "mongodb+srv://lumconon0911:SWD-SWD@cluster.slolqwf.mongodb.net/"
-DATABASE_NAME = "topdev_jobs_db"
-COLLECTION_NAME = "job_details"
-BASE_URL = "https://vieclam24h.vn"  # Keep this as the base domain
-
-# --- (Rest of your functions: has_all_classes, get_html_content, extract_detail_links, extract_section_content, process_detail_link - these remain unchanged) ---
 
 if __name__ == "__main__":
     client = None
@@ -209,34 +243,39 @@ if __name__ == "__main__":
         collection = db[COLLECTION_NAME]
         print(f"Đang sử dụng database '{DATABASE_NAME}' và collection '{COLLECTION_NAME}'.")
 
-        # Đảm bảo chỉ mục duy nhất trên trường 'url' để ngăn chặn trùng lặp ở cấp độ DB
+        # Đảm bảo các chỉ mục được thiết lập
+        # CHỈ ĐỂ LẠI CHỈ MỤC DUY NHẤT TRÊN 'url' để ngăn URL bị trùng lặp.
+        # Chúng ta KHÔNG TẠO chỉ mục duy nhất trên 'title' HOẶC 'responsibilities'
+        # vì logic "OR" được xử lý trong mã Python.
         try:
             collection.create_index("url", unique=True)
             print("✅ Đã đảm bảo chỉ mục duy nhất trên trường 'url'.")
         except Exception as e:
-            print(f"ℹ️ Lỗi khi tạo chỉ mục duy nhất (có thể đã tồn tại): {e}")
+            print(f"ℹ️ Lỗi khi tạo chỉ mục duy nhất trên 'url' (có thể đã tồn tại): {e}")
 
-        # The initial URL you provided, which includes other parameters
+        # # Nếu bạn đã tạo các chỉ mục duy nhất khác trên title/responsibilities trước đó,
+        # # bạn NÊN xóa chúng để tránh xung đột với logic mới. Ví dụ:
+        # try:
+        #     collection.drop_index("title_1")
+        #     collection.drop_index("responsibilities_1")
+        #     collection.drop_index("title_1_responsibilities_1") # Nếu có chỉ mục tổng hợp
+        #     print("ℹ️ Đã xóa các chỉ mục duy nhất cũ trên title/responsibilities nếu có.")
+        # except Exception as e:
+        #     pass # Bỏ qua nếu chỉ mục không tồn tại
+
         initial_listing_url = "https://vieclam24h.vn/viec-lam-it-phan-mem-o8.html?occupation_ids[]=8&sort_q=priority_max%2Cdesc"
 
-        all_detail_links = set()  # Use a set to store all unique detail links across pages
+        all_detail_links = set()
         page_number = 1
-        max_pages_to_crawl = 3  # Set a reasonable limit for testing (e.g., 3 pages)
+        max_pages_to_crawl = 3
 
         print(f"\n--- BẮT ĐẦU CRAWL DANH SÁCH VIỆC LÀM ---")
 
         while page_number <= max_pages_to_crawl:
-            # Parse the initial URL to get its components
             parsed_url = urlparse(initial_listing_url)
-            query_params = parse_qs(parsed_url.query)  # Get query parameters as a dictionary
-
-            # Update the 'page' parameter
-            query_params['page'] = [str(page_number)]  # 'parse_qs' returns lists for values, so set it as a list
-
-            # Reconstruct the query string
-            new_query_string = urlencode(query_params, doseq=True)  # doseq=True handles lists like occupation_ids[]
-
-            # Reconstruct the full URL for the current page
+            query_params = parse_qs(parsed_url.query)
+            query_params['page'] = [str(page_number)]
+            new_query_string = urlencode(query_params, doseq=True)
             current_page_url = urlunparse(parsed_url._replace(query=new_query_string))
 
             print(f"\n🔎 Đang truy cập trang danh sách: {current_page_url}")
@@ -249,26 +288,25 @@ if __name__ == "__main__":
                 if not detail_links_on_page:
                     print(
                         f"Không tìm thấy liên kết chi tiết nào trên trang {page_number}. Có thể đã hết trang hoặc cấu trúc thay đổi.")
-                    break  # No more links found, exit the pagination loop
+                    break
 
                 new_links_count_on_page = 0
                 for link in detail_links_on_page:
-                    if link not in all_detail_links:  # Only add if it's a truly new link
-                        all_detail_links.add(link)
+                    normalized_link = normalize_url(link)
+                    if normalized_link not in all_detail_links:
+                        all_detail_links.add(normalized_link)
                         new_links_count_on_page += 1
 
                 print(
                     f"Tìm thấy {len(detail_links_on_page)} liên kết trên trang {page_number}. Thêm {new_links_count_on_page} liên kết mới vào danh sách tổng.")
 
-                # If no *new* links were found on this page (and it's not the first page),
-                # it's likely we've crawled all available pages or reached the end.
                 if new_links_count_on_page == 0 and page_number > 1:
                     print(
                         f"Không tìm thấy liên kết mới nào trên trang {page_number}. Có thể đã thu thập tất cả hoặc đến cuối.")
                     break
 
                 page_number += 1
-                time.sleep(random.uniform(2, 5))  # Be polite, add a delay between list page requests
+                time.sleep(random.uniform(2, 5))
             else:
                 print(
                     f"Không thể lấy nội dung HTML từ '{current_page_url}' để phân tích liên kết. Dừng lại quá trình crawl danh sách.")
@@ -280,19 +318,18 @@ if __name__ == "__main__":
             print(
                 f"\nTổng số {len(all_detail_links)} liên kết chi tiết duy nhất đã được tìm thấy qua tất cả các trang.")
             links_to_process = list(all_detail_links)
-            random.shuffle(links_to_process)  # Randomize order for more diverse crawling
+            random.shuffle(links_to_process)
 
-            # You can set a limit to process only a subset of links for testing
-            max_details_to_process = 50  # Process at most 50 detail links for a test run
+            max_details_to_process = 10
             if len(links_to_process) > max_details_to_process:
                 print(
                     f"Chỉ xử lý {max_details_to_process} liên kết chi tiết đầu tiên trong số {len(links_to_process)} tìm thấy (thay đổi 'max_details_to_process' để điều chỉnh).")
                 links_to_process = links_to_process[:max_details_to_process]
 
             for i, link in enumerate(links_to_process):
-                print(f"\n({i + 1}/{len(links_to_process)}) ")  # Show progress
+                print(f"\n({i + 1}/{len(links_to_process)}) ")
                 process_detail_link(link, collection)
-                time.sleep(random.uniform(1, 3))  # Delay between detail page requests
+                time.sleep(random.uniform(1, 3))
 
         else:
             print("Không tìm thấy bất kỳ liên kết chi tiết nào.")
